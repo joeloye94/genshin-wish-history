@@ -191,6 +191,76 @@ def test_broadcast_unsubscribe_no_leak():
     asyncio.run(run())
 
 
+def test_pity_counting_with_same_timestamp_multipull():
+    # Synthetic sequence on one gacha_type, including a same-timestamp 10-pull
+    # style batch (ids 10-13 all share one time) - regression test for
+    # db._chrono_sort_key/_add_pity_and_fiftyfifty needing `id` as a
+    # tiebreaker since `time` alone can't order same-timestamp rows. Uses
+    # gacha_type '200' (Standard) so won_fiftyfifty stays trivially None and
+    # the test isolates pity behavior.
+    rows = [
+        {"id": "1", "gacha_type": "200", "time": "2022-01-01 00:00:00", "rank_type": "3", "item_type": "Weapon", "name": "x"},
+        {"id": "2", "gacha_type": "200", "time": "2022-01-01 00:00:00", "rank_type": "5", "item_type": "Character", "name": "x"},
+        {"id": "3", "gacha_type": "200", "time": "2022-01-02 00:00:00", "rank_type": "3", "item_type": "Weapon", "name": "x"},
+        # same-timestamp batch, ids 10-13: pull order must follow id, not
+        # insertion/time order (all four share one `time`)
+        {"id": "13", "gacha_type": "200", "time": "2022-01-03 00:00:00", "rank_type": "3", "item_type": "Weapon", "name": "x"},
+        {"id": "10", "gacha_type": "200", "time": "2022-01-03 00:00:00", "rank_type": "3", "item_type": "Weapon", "name": "x"},
+        {"id": "12", "gacha_type": "200", "time": "2022-01-03 00:00:00", "rank_type": "5", "item_type": "Character", "name": "x"},
+        {"id": "11", "gacha_type": "200", "time": "2022-01-03 00:00:00", "rank_type": "3", "item_type": "Weapon", "name": "x"},
+    ]
+    db._add_pity_and_fiftyfifty(rows)
+    by_id = {r["id"]: r["pity"] for r in rows}
+    assert by_id == {"1": 1, "2": 2, "3": 1, "10": 2, "11": 3, "12": 4, "13": 1}
+    assert all(r["won_fiftyfifty"] is None for r in rows)  # gacha_type 200 - always null
+
+
+def test_pity_counting_paimon_ids_and_independent_gacha_types():
+    # paimon_<gacha_type>_<i> ids sort by their trailing integer, not string
+    # order (e.g. "...12" must sort after "...5", which plain string
+    # comparison gets wrong). Also checks gacha_type 301 and 302 pity chains
+    # don't interfere with each other even though rows are interleaved here.
+    rows = [
+        {"id": "paimon_301_5", "gacha_type": "301", "time": "2021-01-01 00:00:00", "rank_type": "5", "item_type": "Character", "name": "x"},
+        {"id": "paimon_302_1", "gacha_type": "302", "time": "2021-01-01 00:00:00", "rank_type": "3", "item_type": "Weapon", "name": "x"},
+        {"id": "paimon_301_9", "gacha_type": "301", "time": "2021-01-02 00:00:00", "rank_type": "3", "item_type": "Weapon", "name": "x"},
+        {"id": "paimon_301_12", "gacha_type": "301", "time": "2021-01-03 00:00:00", "rank_type": "3", "item_type": "Weapon", "name": "x"},
+        {"id": "paimon_302_2", "gacha_type": "302", "time": "2021-01-04 00:00:00", "rank_type": "5", "item_type": "Weapon", "name": "x"},
+    ]
+    db._add_pity_and_fiftyfifty(rows)
+    by_id = {r["id"]: r["pity"] for r in rows}
+    assert by_id == {"paimon_301_5": 1, "paimon_301_9": 1, "paimon_301_12": 2, "paimon_302_1": 1, "paimon_302_2": 2}
+
+
+def test_resolve_won_fiftyfifty_banner_phases():
+    # Real historical dates/items, spot-checked against known Genshin banner
+    # facts (see report). Regression test for db.resolve_won_fiftyfifty and
+    # its underlying data/banner_data.json built by scripts/build_banner_data.py.
+    # Win: Flins was the featured 5-star on the character-event banner active
+    # 2026-09-01..2026-09-22.
+    assert db.resolve_won_fiftyfifty("301", "Character", "Flins", "2026-09-20 19:29:29") is True
+
+    # Loss: Diluc is one of the five permanent Standard-pool 5-star
+    # characters, so pulling him on a Character Event banner is always an
+    # off-banner 50/50 loss, regardless of who the rate-up was.
+    assert db.resolve_won_fiftyfifty("301", "Character", "Diluc", "2022-05-31 13:11:40") is False
+
+    # Dual-banner window: 2021-11-24..2021-12-14 ran Albedo's "Secretum
+    # Secretorum" concurrently with Eula's "Born of Ocean Swell" (two
+    # separate gacha_types 301/400 upstream, both coerced to 301 by this
+    # app's import - see import_paimon_backup.py). A pull landing on Eula
+    # here must resolve as a win via the unioned dual-window featured list,
+    # not just Albedo's single-phase list.
+    assert db.resolve_won_fiftyfifty("301", "Character", "Eula", "2021-11-30 12:00:00") is True
+
+    # Standard (200) and Beginner (100) never have a rate-up concept.
+    assert db.resolve_won_fiftyfifty("200", "Character", "Diluc", "2022-05-31 13:11:40") is None
+    assert db.resolve_won_fiftyfifty("100", "Character", "Diluc", "2022-05-31 13:11:40") is None
+
+    # Unresolvable item name -> null, not a crash.
+    assert db.resolve_won_fiftyfifty("301", "Character", "Totally Unknown Character", "2022-05-31 13:11:40") is None
+
+
 def test_sync_now_malformed_url_is_400_not_500():
     # A getGachaLog URL missing `authkey` should 400 cleanly (matches /authkey),
     # not fall through to an unhandled 500. Regression test for main.py sync_now().
@@ -220,5 +290,8 @@ if __name__ == "__main__":
     test_resolve_icon_url()
     test_broadcast_thread_safety()
     test_broadcast_unsubscribe_no_leak()
+    test_pity_counting_with_same_timestamp_multipull()
+    test_pity_counting_paimon_ids_and_independent_gacha_types()
+    test_resolve_won_fiftyfifty_banner_phases()
     test_sync_now_malformed_url_is_400_not_500()
     print("all checks passed")

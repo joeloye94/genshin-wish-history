@@ -96,3 +96,11 @@ tr.rank-5 {
 tr.rank-4 {
   color: #7b2ff7;
 }
+
+tr.won-fiftyfifty {
+  background-color: rgba(46, 160, 67, 0.12);
+}
+
+tr.lost-fiftyfifty {
+  background-color: rgba(220, 53, 69, 0.12);
+}
